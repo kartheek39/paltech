@@ -1,0 +1,179 @@
+// Consolidated Jenkinsfile for the new 'weekly-zap-scanner' pipeline
+pipeline {
+    agent any 
+
+    environment {
+        DEFAULT_CC_RECIPIENTS = 'kartheek.bodigam@pal.tech'
+        ZAP_REPORTS_BASE_DIR = "zap-reports/${currentBuild.number}"
+        // Default timeout for each ZAP scan (e.g., 30 minutes)
+        ZAP_SCAN_TIMEOUT_MINUTES = 10
+    }
+
+    stages {
+        stage('Checkout Project Configuration') {
+            steps {
+                echo "Projects configuration file will be read from the workspace."
+            }
+        }
+
+        stage('Execute ZAP Scans and Send Reports') {
+            steps {
+                script {
+                    def projectsConfig = []
+                    try {
+                        projectsConfig = readJSON file: 'projects.json'
+                        echo "Successfully loaded ${projectsConfig.size()} projects for ZAP scan."
+                    } catch (Exception e) {
+                        error "Failed to read projects.json. Make sure the file exists and is valid JSON. Error: ${e.getMessage()}"
+                    }
+
+                    def overallPipelineStatus = 'SUCCESS' 
+
+                    if (projectsConfig.isEmpty()) {
+                        echo "No projects defined in projects.json to scan. This pipeline will complete without running any ZAP scans."
+                        return 
+                    }
+
+                    // Loop through each project and execute ZAP scan
+                    for (int i = 0; i < projectsConfig.size(); i++) {
+                        def project = projectsConfig[i]
+                        def projectName = project.name
+                        def baseUrl = project.baseUrl
+                        def applicationRoute = project.applicationRoute
+                        def projectEmailRecipients = project.emailRecipients ?: env.DEFAULT_CC_RECIPIENTS
+
+                        def targetUrl = "${baseUrl}/${applicationRoute}"
+                        def dateStr = new Date().format('yyyyMMdd')
+                        def safeProjectName = projectName.replaceAll('[^a-zA-Z0-9_.-]', '_')
+                        def safeRouteName = applicationRoute.replaceAll('[^a-zA-Z0-9_.-]', '_')
+                        def reportFileName = "${safeProjectName}_${safeRouteName}_${dateStr}.html"
+                        def projectReportDir = "${env.ZAP_REPORTS_BASE_DIR}/${safeProjectName}"
+                        def reportFilePath = "${projectReportDir}/${reportFileName}"
+
+                        echo "\n--- Initiating ZAP Scan for Project: ${projectName}"
+                        echo "  Target URL: ${targetUrl}"
+                        echo "  Report will be saved to: ${reportFilePath}"
+                        echo "  Email To: ${projectEmailRecipients}"
+                        echo "  Email CC: ${env.DEFAULT_CC_RECIPIENTS}"
+                        echo "  Timeout for this scan: ${env.ZAP_SCAN_TIMEOUT_MINUTES} minutes"
+
+                        try {
+                            sh "mkdir -p \"${projectReportDir}\""
+                            sh "chmod -R 777 \"${projectReportDir}\""
+
+                            // --- ADDING THE TIMEOUT HERE ---
+                            timeout(time: env.ZAP_SCAN_TIMEOUT_MINUTES as int, unit: 'MINUTES', activity: true) { // 'activity: true' will reset the timer if there's console output
+                                def zapScanCommand = """
+                                    docker run --rm \\
+                                        -v "\$PWD/${projectReportDir}:/zap/wrk/:rw" \\
+                                        -t zaproxy/zap-stable \\
+                                        zap-baseline.py -t "${targetUrl}" -r "${reportFileName}" -d || true
+                                """
+                                sh label: "Run ZAP Scan for ${projectName}", script: zapScanCommand
+                            }
+                            // --- END OF TIMEOUT BLOCK ---
+
+                            // These steps only execute if the timeout did NOT occur
+                            archiveArtifacts artifacts: "${reportFilePath}", fingerprint: true, allowEmpty: true
+                            echo "  Report archived: ${reportFilePath}"
+
+                            emailext(
+                                subject: "ZAP Scan Report for ${projectName} (${applicationRoute}) - Build #${currentBuild.number}",
+                                body: """
+                                Hi Team,
+                                
+                                Please find attached the ZAP scan report for the application:-${projectName}(${applicationRoute}).
+                                
+                                Scan Details:
+                                Target URL: ${targetUrl}
+                                
+                                Please review the report for any findings.
+                                
+                                Regards,
+                                Jenkins Automation
+                                """,
+                                to: "${projectEmailRecipients},${env.DEFAULT_CC_RECIPIENTS}",
+                                // cc: "${env.DEFAULT_CC_RECIPIENTS}",
+                                from: 'no-reply@pal.tech',
+                                attachmentsPattern: "${reportFilePath}"
+                            )
+                            echo "  Report email sent for ${projectName}."
+
+                        } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
+                            // This specific exception is caught when a timeout occurs
+                            echo "  WARNING: ZAP scan for ${projectName} timed out after ${env.ZAP_SCAN_TIMEOUT_MINUTES} minutes."
+                            overallPipelineStatus = 'UNSTABLE' 
+                            
+                            // Send a timeout notification for this specific project
+                            emailext(
+                                subject: "ZAP Scan TIMED OUT for ${projectName} (${applicationRoute})",
+                                body: """
+                                Hi Team,
+                                
+                                The ZAP baseline scan for- ${projectName}(${applicationRoute}) timed out after ${env.ZAP_SCAN_TIMEOUT_MINUTES} minutes.
+                                
+                                Details:
+                                Target URL: ${targetUrl}
+                                
+                                Please investigate why this scan is taking too long. No ZAP report could be generated for this project.
+                                
+                                Regards,
+                                Jenkins Automation
+                                """,
+                                to: "${projectEmailRecipients},${env.DEFAULT_CC_RECIPIENTS}",
+                                // cc: "${env.DEFAULT_CC_RECIPIENTS}",
+                                from: 'no-reply@pal.tech'
+                            )
+                        } catch (Exception e) {
+                            // Catch any other general errors during the scan/reporting process
+                            echo "  ERROR: ZAP scan or reporting failed for ${projectName}: ${e.getMessage()}"
+                            overallPipelineStatus = 'FAILURE' // Mark overall status as failure
+                            
+                            // Send a failure notification for this specific project
+                            emailext(
+                                subject: "ZAP Scan FAILED for ${projectName} (${applicationRoute})",
+                                body: """
+                                Hi Team,
+                                
+                                The ZAP scan for- ${projectName}(${applicationRoute}) failed or encountered an unexpected error.
+                                
+                                Details:
+                                Target URL: ${targetUrl}
+                                Jenkins Build: ${env.BUILD_URL}
+                                Error:** ${e.getMessage()}
+                                
+                                Please check the Jenkins job log for more details.
+                                
+                                Regards,
+                                Jenkins Automation
+                                """,
+                                to: "${projectEmailRecipients},${env.DEFAULT_CC_RECIPIENTS}",
+                                // cc: "${env.DEFAULT_CC_RECIPIENTS}",
+                                from: 'no-reply@pal.tech'
+                            )
+                        }
+                        echo "--------------------------------------------------------"
+                    } // End of for loop
+
+                    // Set the overall build status based on whether any individual scan failed
+                    if (overallPipelineStatus == 'FAILURE') {
+                        currentBuild.result = 'FAILURE'
+                        error "One or more ZAP scans had critical failures. Please review the pipeline logs and individual email notifications for details."
+                    } else if (overallPipelineStatus == 'UNSTABLE') {
+                        currentBuild.result = 'UNSTABLE'
+                        echo "Some ZAP scans timed out. Please review the pipeline logs and individual email notifications."
+                    } else {
+                        echo "\nAll configured ZAP scans completed successfully and reports were sent for this week."
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            sh "rm -rf ${env.ZAP_REPORTS_BASE_DIR}"
+            echo "Cleaned up ZAP report directory for this build."
+        }
+    }
+}
