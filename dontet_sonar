@@ -1,0 +1,30 @@
+def call(Map config) {
+    withCredentials([string(credentialsId: 'sonarqube-test', variable: 'SONAR_AUTH_TOKEN')]) {
+        def workingDir = config.WORKING_DIR ?: '.'  // Use current directory if not specified
+        def coverageReportFileName = "coverage.xml"
+        def coverageReportDirectory = "TestResults"
+        def coverageReportPath = "${coverageReportDirectory}/${coverageReportFileName}"
+        sh """
+            docker run --rm \\
+              -v \$(pwd):/app \\
+              -e SONAR_TOKEN=\${SONAR_AUTH_TOKEN} \\
+              -e SONAR_PROJECT_KEY=${config.SONAR_PROJECT_NAME} \\
+              -e SONAR_PROJECT_NAME=${config.SONAR_PROJECT_NAME} \\
+              -e SONAR_HOST_URL=\${SONAR_HOST_URL} \\
+              ${DOTNET_DOCKER_IMAGE_COVERAGE} bash -c '
+                  cd /app/${workingDir} && \\
+                  export PATH=\$PATH:/root/.dotnet/tools && \\
+                  dotnet sonarscanner begin \\
+                      /k:"\$SONAR_PROJECT_KEY" \\
+                      /n:"\$SONAR_PROJECT_NAME" \\
+                      /d:sonar.token="\$SONAR_TOKEN" \\
+                      /d:sonar.host.url="\$SONAR_HOST_URL" \\
+                      /d:sonar.visibility=private \\
+                      /d:sonar.cs.vscoveragexml.reportsPaths="${coverageReportPath}" && \\
+                  dotnet build && \\
+                  dotnet-coverage collect "dotnet test --results-directory TestResults" -f xml -o "${coverageReportPath}" && \\
+                  dotnet sonarscanner end /d:sonar.token="\$SONAR_TOKEN"
+              '
+        """
+    }
+}
