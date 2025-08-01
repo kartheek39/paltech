@@ -1,0 +1,184 @@
+def lastSuccessfulBuildID = 0
+def port = ''
+def webhookUrl = 'https://paltech0.webhook.office.com/webhookb2/1ce07c79-9b4b-4e81-ab89-253715dccd77@1680abbe-1a01-4cb0-99e9-452fe05bf615/JenkinsCI/5f60144024ad41ec810a4f17f7d5b910/a74c3df4-0c59-455b-8969-c52e309262f8/V25pflnb8k-tTrBwFw2Zc6byymK7ITv97TcCBaJlp76w81'
+def agentLabel() {
+    if ("${env.BRANCH_NAME.toLowerCase()}" == 'main')
+        return 'PTVSER01'
+    else
+        return 'ubuntu'
+}
+
+@Library('SonarQubeAnalysis') _
+
+pipeline {
+    agent {label agentLabel()}
+
+    // triggers {
+    //     pollSCM('H/5 * * * *') // Polls every 5 minutes
+    // }
+
+    stages {
+        stage('Git pull') {
+            steps {
+                cleanWs()
+                script {
+                    git branch:env.BRANCH_NAME, credentialsId: 'readonly', url: 'https://gitlab.pal.tech/civet/api.git'
+                    branch = "${env.BRANCH_NAME.toLowerCase()}"
+                     if (("$branch").matches('development')) {
+                        branch = 'development'
+                        envr = 'Development'
+                        port = '9363'
+                    }
+
+                    else if (("$branch").matches('qa')) {
+                        envr = 'qa'
+                        port = '9366'
+                    }
+
+                    else if (("$branch").matches('main')) {
+                        envr = 'prod'
+                        port = '9215'
+                    }
+
+                     else if (("$branch").matches('uat')) {
+                        envr = 'uat'
+                        port = '9369'
+
+                    }
+
+
+                    def build = currentBuild.previousBuild
+                    while (build != null) {
+                        if (build.result == 'SUCCESS') {
+                            lastSuccessfulBuildID = build.id as Integer
+                            break
+                        }
+                        build = build.previousBuild
+                    }
+                    echo "${port}"
+                    echo "${branch}"
+                    
+                    println lastSuccessfulBuildID
+                }
+            }
+        }
+
+        stage('Add Configuration') {
+            steps {
+                script {
+                    configFileProvider([configFile(fileId: "appsettings-${branch}-json", variable: 'ENV_CONFIG')]) {
+                        sh "cp $ENV_CONFIG Civet.API/appsettings.json"
+                    }
+                }
+            }
+        }
+
+        stage('Run Unit Tests') {
+            steps {
+                script {
+                    docker.image('mcr.microsoft.com/dotnet/sdk:8.0').inside {
+                        withEnv(['DOTNET_CLI_HOME=/tmp']) {
+
+                            sh 'dotnet restore Civet.UnitTest/Civet.UnitTest.csproj'
+                            sh 'dotnet test Civet.UnitTest/Civet.UnitTest.csproj --logger "trx;LogFileName=test_results.trx"'
+                                    
+                            sh '''
+                                export PATH="$PATH:/tmp/.dotnet/tools"
+                                dotnet tool install -g trx2junit || true
+                                trx2junit Civet.UnitTest/TestResults/*.trx || true
+                            '''
+                            
+                            junit 'Civet.UnitTest/TestResults/*.xml'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Parallel Tasks') {
+            parallel {
+                stage('SonarQube Analysis') {
+                    when {
+                        expression {
+                            def sonarqubeUrl = env.SONAR_HOST_URL
+                            def isSonarQubeUp = false
+                            script {
+                                try {
+                                    def curlCommand = "curl -s -k --connect-timeout 5 --max-time 10 \"${sonarqubeUrl}\""
+                                    def curlExitCode = sh(script: curlCommand, returnStatus: true)
+                                    if (curlExitCode == 0) {
+                                        isSonarQubeUp = true
+                                    } else {
+                                        echo "WARNING: SonarQube URL ${sonarqubeUrl} is not reachable (curl exit code: ${curlExitCode}). Skipping SonarQube Analysis stage."
+                                    }
+                                } catch (Exception e) {
+                                    echo "ERROR during curl check: ${e.getMessage()}"
+                                    isSonarQubeUp = false
+                                }
+                            }
+                            return isSonarQubeUp
+                        }
+                    }
+                    steps {
+                        script {
+                            if (env.BRANCH_NAME == 'development') {
+                                Dotnetsonaranalysis(
+                                    SONAR_PROJECT_NAME: "civet-api-${env.BRANCH_NAME}"
+                                )
+                            }
+                        }
+                    }
+                }
+
+                stage('Build and Deploy') {
+                    stages {
+                        stage('Build Docker Image') {
+                            steps {
+                                sh "docker build -t civet-api-${branch}-b${BUILD_NUMBER} -f Dockerfile --no-cache ."
+                            }
+                        }
+
+                        stage('Delete previous docker containers') {
+                            steps {
+                                sh "docker container stop \$(docker container ls -q --filter name=civet-api-${branch}) || true"
+                                sh "docker container rm -f \$(docker container ps -a -q --filter name=civet-api-${branch}) || true"
+                            }
+                        }
+
+                        stage('Create new container') {
+                            steps {
+                                script {
+                                    containerID = sh(
+                                        script: "docker run -d -p ${port}:5000  -e ASPNETCORE_ENVIRONMENT='${envr}' --network pt-net --name civet-api-${branch} civet-api-${branch}-b${BUILD_NUMBER}",
+                                        returnStdout: true
+                                    ).trim()
+
+                                    echo "Container ID is ==> ${containerID}"
+                                    sh "docker update --restart always ${containerID}"
+                                    sh "docker rmi \$(docker images -f=reference=civet-api-${branch}-b${lastSuccessfulBuildID} --format \"{{.ID}}\") || true"
+                                }
+                            }
+                        }
+
+                        // stage('Cleanup') {
+                        //     steps {
+                        //         cleanWs()
+                        //     }
+                        // }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                office365ConnectorSend(
+                    webhookUrl: webhookUrl,
+                    message: "Please find status of pipeline: Status-<strong>${currentBuild.currentResult}</strong><br>Jenkins URL: ${env.JENKINS_URL}job/Civet/job/civet-api/job/${env.BRANCH_NAME}/<br><strong>Branch: ${env.BRANCH_NAME}</strong><br>Job: ${env.JOB_NAME}<br>Repository URL: https://gitlab.pal.tech/civet/api.git"
+                )
+            }
+        }
+    }
+}
